@@ -16,13 +16,16 @@
 # limitations under the License.
 
 import os
+import re
 import json
 import glob
 import humanfriendly
 import textwrap
+from packaging import version
 from loguru import logger
 from pathlib import Path
 from bundlegen.core.utils import Utils
+from bundlegen.core.readelf import ReadElf
 
 
 class BundleProcessor:
@@ -536,6 +539,100 @@ class BundleProcessor:
         self.oci_config['rdkPlugins']['logging'] = logging_plugin
         return
 
+    def _remove_from_rootfs(self, rootfs_filepath):
+        """Remove from rootfs. If it is a link, also remove linked file.
+        """
+        link = os.path.realpath(rootfs_filepath)
+        os.remove(rootfs_filepath)
+        if (link != rootfs_filepath):
+            os.remove(link)
+
+    def _take_host_or_rootfs_lib(self, rootfs_wins, lib, api_info):
+        """ If rootfs wins, keep the file and log it. If host wins
+            create a mount bind and remove the file from rootfs.
+            Do the same for any sublibs.
+        """
+        if rootfs_wins:
+            logger.debug(f"IMAGE version wins ({lib})")
+            if api_info.get('sublibs'):
+                for sublib in api_info['sublibs']:
+                    logger.debug(f"IMAGE version wins ({sublib})")
+        else:
+            logger.debug(f"HOST  version wins ({lib})")
+            rootfs_filepath = os.path.join(self.rootfs_path, lib.lstrip('/'))
+            self._add_bind_mount(lib, lib)
+            self._remove_from_rootfs(rootfs_filepath)
+            if api_info.get('sublibs'):
+                for sublib in api_info['sublibs']:
+                    sublib_rootfs_filepath = os.path.join(self.rootfs_path, sublib.lstrip('/'))
+                    if os.path.exists(sublib_rootfs_filepath):
+                        self._add_bind_mount(sublib, sublib)
+                        self._remove_from_rootfs(sublib_rootfs_filepath)
+
+    # ==========================================================================
+    def _mount_or_use_rootfs(self, lib, mount_if_not_on_rootfs):
+        """Mount lib from host OR use the one inside bundle rootfs.
+           If lib exists in rootfs and apiversions info exists for it inside *_libs.json config
+           then we try to use that version of the lib that has most API versions defined inside.
+
+        Args:
+            lib (string): lib name like /lib/libc.so.6
+            mount_if_not_on_rootfs (bool): if lib doesn't exist inside rootfs
+                                           add a mount
+        """
+        rootfs_filepath = os.path.join(self.rootfs_path, lib.lstrip('/'))
+        if os.path.exists(rootfs_filepath):
+            api_info = None
+            if self.platform_cfg.get('libs'):
+                api_info = [x for x in self.platform_cfg['libs'] if x['name'] == lib]
+            if api_info:
+                api_info = api_info[0]
+                version_defs_by_host_lib = set(api_info['apiversions'])
+                version_defs_by_rootfs_lib = set(ReadElf.retrieve_apiversions(rootfs_filepath))
+
+                # remove from rootfs and mount lib from host if
+                # host lib contains more or same version definitions
+                if (version_defs_by_host_lib >= version_defs_by_rootfs_lib):
+                    ## Library on host has more or same API versions as the one from bundle rootfs. Removing from rootfs and adding mount bind.
+                    diff = version_defs_by_host_lib - version_defs_by_rootfs_lib
+                    if (len(diff) == 0):
+                        logger.debug(f"Host {lib} has same set of apiversions")
+                    else:
+                        logger.debug(f"Host {lib} more: {diff}")
+                    self._take_host_or_rootfs_lib(False, lib, api_info)
+                elif (version_defs_by_host_lib < version_defs_by_rootfs_lib):
+                    ## Library on host has less API versions than the one from bundle rootfs. Keeping the one from bundle rootfs.
+                    logger.debug(f"Image {lib} more: {version_defs_by_rootfs_lib - version_defs_by_host_lib}")
+                    self._take_host_or_rootfs_lib(True, lib, api_info)
+                else:
+                    # last attempt: some libs contain something like xxx_PRIVATE_1.10.10
+                    ## take lib with most recent one
+                    made_choice = False
+                    diff1 = version_defs_by_host_lib - version_defs_by_rootfs_lib
+                    diff2 = version_defs_by_rootfs_lib - version_defs_by_host_lib
+                    if (len(diff1) == 1) and (len(diff2) == 1):
+                        version1 = next(iter(diff1))
+                        version2 = next(iter(diff2))
+
+                        if re.match(r"^\S+_PRIVATE_[0-9\.]+$", version1) and re.match(r"^\S+_PRIVATE_[0-9\.]+$", version2):
+                            made_choice = True
+                            if version.parse(version1) >= version.parse(version2):
+                                logger.debug(f"Version {lib}: {version1} >= {version2}")
+                                self._take_host_or_rootfs_lib(False, lib, api_info)
+                            else:
+                                logger.debug(f"Version {lib}: {version1} < {version2}")
+                                self._take_host_or_rootfs_lib(True, lib, api_info)
+
+                    if (not made_choice):
+                        logger.error(f"Cannot decide which library to choose! {lib}")
+                        logger.error(diff1.union(diff2))
+            else:
+                self._add_bind_mount(lib, lib)
+                logger.debug(f"No apiversions info found for {lib}. Removing because adding mount bind.")
+                self._remove_from_rootfs(rootfs_filepath)
+        elif mount_if_not_on_rootfs:
+            self._add_bind_mount(lib, lib)
+
     # ==========================================================================
     def _process_lib_matching(self):
         """
@@ -547,18 +644,15 @@ class BundleProcessor:
         logger.debug("rootfs path is " + self.rootfs_path)
 
         for lib in self.platform_cfg['dobby']['pluginDependencies']:
-            # Add bind mount
-            self._add_bind_mount(lib, lib)
+            self._mount_or_use_rootfs(lib, True)
 
-            # If the file existed in the rootfs, delete it
-            rootfs_filepath = os.path.join(self.rootfs_path, lib.lstrip('/'))
-            if os.path.exists(rootfs_filepath):
-                logger.debug(
-                    f"Library that exists in rootfs is now bind mounted. Deleting lib from rootfs ({rootfs_filepath})")
-                os.remove(rootfs_filepath)
-
-        # TODO:: Add library matching to bind mount any libraries that are
-        # the same in the image as on the host to reduce bundle size
+        """
+        Go over all libs for which we have apiversions info
+        Decide whether to use lib from OCI image rootfs OR host.
+        """
+        if self.platform_cfg.get('libs'):
+            for lib in self.platform_cfg['libs']:
+                self._mount_or_use_rootfs(lib['name'], False)
 
     # ==========================================================================
     def _cleanup_umoci_leftovers(self):
