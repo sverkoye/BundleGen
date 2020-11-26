@@ -62,8 +62,7 @@
                 ]
             }
         ],
-        "envvar": [
-        ],
+        "envvar": [],
         "devs": [
             {
                 "type": "c",
@@ -141,6 +140,22 @@
             {
                 "src": "/usr/lib/libwayland-client.so.0",
                 "dst": "/usr/lib/libwayland-client.so.0"
+            },
+            {
+                "src": "/usr/lib/libffi.so.6",
+                "dst": "/usr/lib/libffi.so.6"
+            },
+            {
+                "src": "/lib/libgcc_s.so.1",
+                "dst": "/lib/libgcc_s.so.1"
+            },
+            {
+                "src": "/lib/libc.so.6",
+                "dst": "/lib/libc.so.6"
+            },
+            {
+                "src": "/usr/lib/libstdc++.so.6",
+                "dst": "/usr/lib/libstdc++.so.6"
             }
         ]
     },
@@ -171,18 +186,5 @@
     "logging": {
         "mode": "file",
         "logDir": "/var/log"
-    },
-    "dobby": {
-        "pluginDir": "/usr/lib/plugins/dobby",
-        "pluginDependencies": [
-            "/lib/libcap.so.2",
-            "/lib/libsystemd.so.0",
-            "/usr/lib/liblzma.so.5",
-            "/usr/lib/libnl-3.so.200",
-            "/usr/lib/libnl-route-3.so.200",
-            "/usr/lib/libstdc++.so.6",
-            "/usr/lib/libyajl.so.2",
-            "/usr/lib/libffi.so.6"
-        ]
     }
 }
